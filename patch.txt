@@ -1,9 +1,9 @@
 -- Start of DDL Script for Trigger LIVE.PRE_SUBJOB
 -- Generated 10-09-2024 23:09:19 from LIVE@vdspldb1
 
-CREATE OR REPLACE TRIGGER pre_subjob
+CREATE OR REPLACE TRIGGER pre_subjob_test
  BEFORE
-  INSERT OR UPDATE
+  INSERT
  ON subjob
 REFERENCING NEW AS NEW OLD AS OLD
  FOR EACH ROW
