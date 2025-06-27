@@ -1,0 +1,698 @@
+-- Start of DDL Script for Trigger LIVE.PRE_SUBJOB
+-- Generated 10-09-2024 23:09:19 from LIVE@vdspldb1
+
+CREATE OR REPLACE TRIGGER pre_subjob
+ BEFORE
+  INSERT OR UPDATE
+ ON subjob
+REFERENCING NEW AS NEW OLD AS OLD
+ FOR EACH ROW
+DECLARE
+
+    CURSOR cur_glt
+    IS
+        SELECT   SUM (DECODE (dr_cr, 'D', local_amount, -local_amount)) amt
+          FROM   fas_gl_transaction
+         WHERE   company_code = NVL (:new.company_code, :old.company_code)
+                 AND branch_code = NVL (:new.branch_code, :old.branch_code)
+                 AND subjob_uid = NVL (:new.subjob_uid, :old.subjob_uid)
+                 AND charge_code IS NOT NULL;
+
+    rec_glt   cur_glt%ROWTYPE;
+
+    cursor cur_kyc(ca_code customer_master.code%type) is
+    select verified,customer_Code,
+            document_code
+    from customer_profile
+    where customer_Code = ca_code
+    and nvl(verified,'N') = 'Y';
+    rec_kyc cur_kyc%rowtype;
+
+    lv_code customer_master.code%type;
+
+    cursor cur_cusmaster(lv_code customer_master.code%type) is
+    select code,branch_code
+    from customer_master
+    where country_code = 'IN'
+    and code = lv_code;
+    rec_cusmaster cur_cusmaster%rowtype;
+
+
+    cursor cur_subjob_tree is
+    select is_service_job
+    from subjob_tree
+    where subjob_uid = :new.subjob_uid;
+    rec_subjob_tree cur_subjob_tree%rowtype;
+
+    CURSOR c_get_console_customer_list IS
+      SELECT
+         cgm.customer_code
+      FROM customer_group_MASTER cg,
+            customer_group_mapping cgm
+      WHERE cg.code =  cgm.group_code
+      AND cg.code ='CONSOLE_BKG_RESTRICT';
+BEGIN
+
+
+
+
+
+if inserting or updating then
+   if nvl(pk_configuration_master.get_value(:new.company_code,'ENABLE_KYC_VALIDATION'),'N')= 'Y' then
+
+    open cur_subjob_tree;
+    fetch cur_subjob_tree into rec_subjob_tree;
+    close cur_subjob_tree;
+
+    if pk_segment_master.get_import_export(:new.booking_segment_code) ='EXPORT'  then
+    lv_code := nvl(:new.billing_customer_Code,:new.shipper_code);
+    elsif pk_segment_master.get_import_export(:new.fdc_segment_code) ='IMPORT' then
+    lv_code := nvl(:new.fdc_billing_customer_Code,:new.consignee_code);
+    elsif  rec_subjob_tree.is_service_job = 'Y' then
+    lv_code := nvl(:new.billing_customer_Code,:new.fdc_billing_customer_Code);
+    end if;
+
+    open cur_kyc(lv_code);
+    fetch cur_kyc into rec_kyc;
+    close cur_kyc;
+
+    open cur_cusmaster(lv_code);
+    fetch cur_cusmaster into rec_cusmaster;
+    close cur_cusmaster;
+
+    if rec_kyc.customer_code is  null and rec_cusmaster.code is not null then
+        raise_application_error(-20001, '~KYC is not verified for the customer code '||'- '||pk_customer_master.get_name(lv_code)||' ('||lv_code||')~');
+    end if;
+    end if;
+END IF;
+
+
+   IF NVL(:NEW.location_code,:NEW.fdc_location_code) ='11009' THEN
+      FOR r_get_console_customer_list IN c_get_console_customer_list
+      LOOP
+         IF inserting THEN
+            IF :NEW.billing_customer_Code = r_get_console_customer_list.customer_code OR
+              :NEW.shipper_code =  r_get_console_customer_list.customer_code OR
+              :NEW.forwarder_Code =  r_get_console_customer_list.customer_code OR
+              :NEW.fdc_billing_customer_code =  r_get_console_customer_list.customer_code OR
+              :NEW.notify_customer1_code =  r_get_console_customer_list.customer_code OR
+              :NEW.consignee_code =  r_get_console_customer_list.customer_code THEN
+              raise_application_error(-20001, '~You Can not use this customer in Booking - '||pk_customer_master.get_name(r_get_console_customer_list.customer_code)||' ('||r_get_console_customer_list.customer_code||')~');
+            END IF;
+         ELSIF updating THEN
+            IF nvl(:NEW.billing_customer_Code,:OLD.billing_customer_Code) = r_get_console_customer_list.customer_code OR
+              NVL(:NEW.shipper_code,:OLD.shipper_code) =  r_get_console_customer_list.customer_code OR
+              NVL(:NEW.forwarder_Code,:OLD.forwarder_Code)  =  r_get_console_customer_list.customer_code OR
+              NVL(:NEW.fdc_billing_customer_code,:OLD.fdc_billing_customer_code)  =  r_get_console_customer_list.customer_code OR
+              NVL(:NEW.notify_customer1_code,:OLD.notify_customer1_code) =  r_get_console_customer_list.customer_code OR
+              NVL(:NEW.consignee_code,:OLD.consignee_code)  =  r_get_console_customer_list.customer_code THEN
+              raise_application_error(-20001, '~You Can not use this customer in Booking - '||pk_customer_master.get_name(r_get_console_customer_list.customer_code)||' ('||r_get_console_customer_list.customer_code||')~');
+            END IF;
+         END IF;
+      END LOOP;
+   END IF;
+
+
+    IF UPDATING
+       AND NVL (
+              pk_configuration_master.get_value (
+              NVL (:new.company_code, :old.company_code),
+                  'RESTRICT_SALESMAN_AFTER_ACC'),
+              'N') = 'Y'
+    THEN
+        IF (:new.routed_by_code <> :old.routed_by_code
+            OR:new.who_routed <> :old.who_routed)
+           AND NVL (:new.is_sam, 'N') = 'N'
+        THEN
+            OPEN cur_glt;
+
+            FETCH cur_glt INTO rec_glt;
+
+            CLOSE cur_glt;
+
+            IF rec_glt.amt <> 0
+            THEN
+                raise_application_error (
+                    -20001,
+                    'Accounting entries already created for this shipment. You cannot modify the salesman name');
+            END IF;
+        END IF;
+    END IF;
+EXCEPTION
+    WHEN OTHERS
+    THEN
+        raise_application_error (-20001, remove_ora (SQLERRM));
+END;
+/
+CREATE OR REPLACE  VIEW CFS_RECEIVE_ENTRY_VIEW ("SEQ", "COMPANY_CODE", "BRANCH_CODE", "LOCATION_CODE", "CFS_RECEIVE_NO", "CFS_RECEIVE_DATE", "CFS_CODE", "CFS_NAME", "CHA_CODE", "CHA_NAME", "SEGMENT_CODE", "SHIPPER_CODE", "SHIPPER_NAME", "FORWARDER_CODE", "FORWARDER_NAME", "CONSIGNEE_CODE", "CONSIGNEE_NAME", "ACTUAL_SHIPPER_NAME", "ACTUAL_CONSIGNEE_NAME", "CO_LOADER_NAME", "DIVISION_NAME", "PACK_CODE", "BOOKING_NO", "POR", "POL", "POD", "FDC", "HUB_PORT_CODE", "STATUS", "SHIPPING_BILL_NO", "SHIPPING_BILL_DATE", "CARTING_DATE", "CUSTOMS_CLEARING_DATE", "EXTERNAL_PACK_CODE", "EXTERNAL_NO_OF_PACK", "GROSS_WEIGHT", "VOLUME", "CFS_SLOT_CODE", "ITEM_DESCRIPTION", "CFS_MARK_NO", "CFS_NOTE", "BOOKING_INTERNAL_NOTE", "SALESMAN_NAME", "TRADE_CODE", "SECTOR_NAME", "SECTOR_CODE", "ETA", "VESSEL_CARRIER_NAME", "SUBJOB_UID", "BOOKING_PERSON_NAME", "UN_NO", "PCIN_NO", "IMO_CODE", "SB", "MM", "IS_AUDIT", "AUDIT_ON", "AUDITED_BY", "ROUTING_NO") AS
+select SEQ,COMPANY_CODE,BRANCH_CODE,LOCATION_CODE,CFS_RECEIVE_NO,CFS_RECEIVE_DATE,CFS_CODE,CFS_NAME,CHA_CODE,CHA_NAME,SEGMENT_CODE,SHIPPER_CODE,SHIPPER_NAME,FORWARDER_CODE,FORWARDER_NAME,CONSIGNEE_CODE,CONSIGNEE_NAME,ACTUAL_SHIPPER_NAME,ACTUAL_CONSIGNEE_NAME,CO_LOADER_NAME,DIVISION_NAME,PACK_CODE,BOOKING_NO,POR,POL,POD,FDC,HUB_PORT_CODE,STATUS,SHIPPING_BILL_NO,SHIPPING_BILL_DATE,CARTING_DATE,CUSTOMS_CLEARING_DATE,EXTERNAL_PACK_CODE,EXTERNAL_NO_OF_PACK,GROSS_WEIGHT,VOLUME,CFS_SLOT_CODE,ITEM_DESCRIPTION,CFS_MARK_NO,CFS_NOTE,BOOKING_INTERNAL_NOTE,SALESMAN_NAME,TRADE_CODE,SECTOR_NAME,SECTOR_CODE,ETA,VESSEL_CARRIER_NAME,SUBJOB_UID,BOOKING_PERSON_NAME,UN_NO,PCIN_NO,IMO_CODE,SB,MM,IS_AUDIT,AUDIT_ON,AUDITED_BY,ROUTING_NO
+from
+(select case when  crd.shipping_bill_no is not null then ROW_NUMBER() OVER(PARTITION BY crd.shipping_bill_no order by crh.cfs_receive_date )
+else 1111
+end seq,
+crh.company_code,
+crh.branch_code,
+crh.location_code,
+crh.cfs_receive_no,
+crh.cfs_receive_date,
+crh.cfs_code,
+pk_cfs_master.get_name(crh.cfs_code) cfs_name,
+crh.cha_code,
+crh.cha_name,
+crh.segment_code,
+crh.shipper_code,
+nvl(crh.shipper_name,pk_customer_master.get_name(crh.shipper_code)) shipper_name,--EF-6361
+crh.forwarder_code,
+nvl(crh.forwarder_name,pk_customer_master.get_name(crh.forwarder_code)) forwarder_name,--EF-6361
+crh.consignee_code,
+nvl(crh.consignee_name,pk_customer_master.get_name(crh.consignee_code)) consignee_name,--EF-6361
+null actual_shipper_name,
+null actual_consignee_name,
+null co_loader_name,
+crh.division_name division_name,
+crd.external_pack_code pack_code,
+null booking_no,
+crh.por,
+crh.pol,
+crh.pod,
+crh.fdc,
+crh.hub_port_code,
+crh.status,
+crd.shipping_bill_no,
+crd.shipping_bill_date,
+crd.carting_date,
+crd.customs_clearing_date,
+crd.external_pack_code,
+crd.external_no_of_pack,
+crd.gross_weight,
+crd.volume,
+crd.cfs_slot_code,
+crd.item_description,
+crd.cfs_mark_no,
+crh.cfs_note,
+null Booking_internal_note,
+null salesman_name,
+null trade_code,
+pk_region_master.get_name(pm.region_code) sector_name ,
+pm.region_code sector_code,
+null eta,
+null vessel_carrier_name,
+null subjob_uid,
+null booking_person_name,
+crd.un_no,
+crd.pcin_no,
+crd.imo_code,
+null SB,
+null MM,
+crh.is_audit,
+crh.audit_on,
+crh.audited_by,
+crh.routing_no
+from cfs_receive_header crh,
+cfs_receive_detail crd,
+port_master pm
+where crh.cfs_receive_no = crd.cfs_receive_no
+and crh.status not in ('CANCELLED','STUFFED')
+and crh.pod = pm.code (+)
+and crh.booking_no is null
+union all
+select case when  crd.shipping_bill_no is not null then
+ROW_NUMBER() OVER(PARTITION BY crd.shipping_bill_no order by crh.cfs_receive_date )
+else
+    1111
+end seq,
+crh.company_code,
+crh.branch_code,
+crh.location_code,
+crh.cfs_receive_no,
+crh.cfs_receive_date,
+crh.cfs_code,
+pk_cfs_master.get_name(crh.cfs_code) cfs_name,
+crh.cha_code,
+crh.cha_name,
+nvl(crh.segment_code,sj.booking_segment_code)segment_code,
+crh.shipper_code,
+nvl(crh.shipper_name,pk_customer_master.get_name(crh.shipper_code)) shipper_name,--EF-6361
+crh.forwarder_code,
+nvl(crh.forwarder_name,pk_customer_master.get_name(crh.forwarder_code)) forwarder_name,--EF-6361
+crh.consignee_code,
+nvl(crh.consignee_name,pk_customer_master.get_name(crh.consignee_code)) consignee_name,--EF-6361
+sj.shipper_manifest_name actual_shipper_name,
+sj.consignee_manifest_name actual_consignee_name,
+sj.co_loader_name co_loader_name,
+crh.division_name division_name,
+crd.external_pack_code pack_code,
+to_char(sj.booking_no) booking_no,
+crh.por,
+crh.pol,
+crh.pod,
+crh.fdc,
+crh.hub_port_code,
+crh.status,
+crd.shipping_bill_no,
+crd.shipping_bill_date,
+crd.carting_date,
+crd.customs_clearing_date,
+crd.external_pack_code,
+crd.external_no_of_pack,
+crd.gross_weight,
+crd.volume,
+crd.cfs_slot_code,
+crd.item_description,
+crd.cfs_mark_no,
+crh.cfs_note,
+NULL Booking_internal_note,
+decode(sj.who_routed,'SELF', pk_employee_master.get_salesman_name(sj.routed_by_code),'AGENT', NULL) salesman_name,
+null trade_code,
+pk_region_master.get_name(pm.region_code) sector_name ,
+pm.region_code sector_code,
+null eta,
+null vessel_carrier_name,
+sj.subjob_uid,
+sj.booking_person_name,
+crd.un_no,
+crd.pcin_no,
+crd.imo_code,
+nvl(jd.sb,'N') SB,
+nvl(jd.mm,'N')  MM,
+crh.is_audit,
+crh.audit_on,
+crh.audited_by,
+crh.routing_no
+from cfs_receive_header crh,
+cfs_receive_detail crd,
+subjob sj,
+port_master pm,
+(select segment_Code,job_subjob_uid,max(case when document_code ='SB' then 'Y'
+end) sb,max(case when document_code = 'MM' then 'Y' end) mm
+from job_document
+group by segment_Code,job_subjob_uid) jd
+where crh.cfs_receive_no = crd.cfs_receive_no
+and crh.booking_no = sj.booking_no -- Gopinath : 23/03/09 : 200810005 starts
+and crh.status not in ('CANCELLED','STUFFED')
+and crh.pod = pm.code (+)
+and nvl(sj.booking_segment_Code,sj.fdc_segment_code) = jd.segment_Code(+)
+and sj.subjob_uid = jd.job_subjob_uid(+)
+and sj.subjob_status not in ('CLOSE','GENERATED')
+union all
+select case when  nvl(jci.shipping_bill_no,cfs.shipping_bill_no) is not null then
+ROW_NUMBER()
+   OVER(PARTITION BY nvl(jci.shipping_bill_no,cfs.shipping_bill_no) order by cfs.cfs_receive_date )
+else
+    1111
+end seq,
+sjt.company_code,
+sjt.branch_code,
+sjt.location_code,
+cfs.cfs_receive_no cfs_receive_no,
+coalesce(sc.unstuffing_date,cfs.cfs_receive_date,j.ata,j.eta) cfs_receive_date,
+nvl(cfs.cfs_code,sc.cfs_code)cfs_code,
+pk_cfs_master.get_name(nvl(cfs.cfs_code,sc.cfs_code)) cfs_name,
+nvl(cfs.cha_code,sj.cha_code)cha_code,
+pk_customer_master.get_name(nvl(cfs.cha_code,sj.cha_code)) cha_name,
+nvl(sjt.segment_code,nvl(cfs.segment_code,sj.booking_segment_code)) segment_code,
+sj.shipper_code,
+pk_customer_master.get_name(sj.shipper_code) shipper_name,
+nvl(cfs.forwarder_code,sj.forwarder_code)forwarder_code,
+pk_customer_master.get_name(nvl(cfs.forwarder_code,sj.forwarder_code)) forwarder_name,
+sj.consignee_code,
+pk_customer_master.get_name(sj.consignee_code) consignee_name,
+sj.shipper_manifest_name actual_shipper_name,
+sj.consignee_manifest_name actual_consignee_name,
+sj.co_loader_name co_loader_name,
+sj.division_name division_name,
+sj.external_pack_code pack_code,
+sj.house_no booking_no,
+sj.por,
+j.pol,
+nvl(sj.transit_port,nvl(sj.pod,j.pod)) pod,
+sj.fdc,
+null,
+case when sc.unstuffing_date is not null then 'UNSTUFFED'
+when sjt.trade_code = 'IMPORT' then 'IMPORT'
+when sjt.trade_code = 'TRANSIT' then 'IN TRANSIT' end status,
+nvl(cfs.shipping_bill_no,jci.shipping_bill_no) shipping_bill_no,
+nvl(cfs.shipping_bill_date,jci.shipping_bill_date) shipping_bill_date,
+nvl(cfs.carting_date,sc.unstuffing_date) carting_date,
+decode(pk_segment_master.get_import_export(sjt.segment_Code),'IMPORT',sc.unstuffing_date,cfs.customs_clearing_date) customs_clearing_date,
+cfs.external_pack_code,
+nvl2(jci.job_subjob_uid,jci.no_of_pack,sc.external_no_of_pack) external_no_of_pack,
+nvl2(jci.job_subjob_uid,jci.gross_weight,sc.gross_weight) gross_weight,
+nvl2(jci.job_subjob_uid,jci.volume,sc.volume) volume,
+nvl(cfs.cfs_slot_code,sj.cfs_slot_code)cfs_slot_code,
+nvl(cfs.item_description,jci.item_description) item_description,
+nvl(cfs.cfs_mark_no,sj.cfs_mark_no)cfs_mark_no,
+nvl(cfs.cfs_note,sj.cfs_note||'-'||sjt.segment_code||'-'||sjt.job_no||'-'||sjt.subjob_no) cfs_note,
+NULL booking_Internal_note,
+decode(sj.who_routed,'SELF', pk_employee_master.get_salesman_name(sj.routed_by_code),'AGENT', NULL) salesman_name,
+sjt.trade_code,
+pk_region_master.get_name(pm.region_code) sector_name ,
+pm.region_code sector_code,
+sj.eta eta,
+(select vessel_carrier_name from job_connection
+where rowid =(
+select max(rowid) from job_connection
+where job_subjob_uid=sj.subjob_uid )) vessel_carrier_name,
+sj.subjob_uid,
+sj.booking_person_name,
+cfs.un_no,
+cfs.pcin_no,
+cfs.imo_code,
+nvl(jd.sb,'N') SB,
+nvl(jd.mm,'N')  MM,
+null is_audit,
+null audit_on,
+null audited_by,
+cfs.routing_no
+from job j,
+subjob sj,
+subjob_tree sjt,
+port_master pm,
+(select sfs.schedule_uid,sfs.subjob_uid from
+sfs_booking_container sbc,
+sfs_loading_detail sfs
+where sfs.schedule_uid = sbc.schedule_uid (+)
+and sfs.loading_uid = sbc.loading_uid (+)
+and nvl(sbc.is_loading_confirmed,'N') <> 'Y')sfs,
+segment_master sm,
+(select job_subjob_uid,
+shipping_bill_no,
+shipping_bill_date,
+item_description,
+no_of_pack,
+gross_weight,
+volume,
+cfs_receive_no
+from job_commodity_item) jci,
+(select sjc.segment_code,
+sjc.job_no,
+sjc.subjob_no,
+jc.company_Code,
+jc.branch_code,
+sum(sjc.external_no_of_pack) external_no_of_pack,
+sum(sjc.gross_weight) gross_weight,
+sum(sjc.volume) volume,
+max(jc.unloading_date) unstuffing_date,
+max(jc.cfs_code) cfs_code
+from subjob_container sjc ,
+job_container jc
+where jc.segment_code = sjc.segment_code
+and jc.job_no = sjc.job_no
+and jc.container_uid = sjc.container_uid
+and jc.company_code = sjc.company_code
+and jc.branch_code = sjc.branch_Code
+group by jc.company_Code,
+jc.branch_code,
+sjc.segment_code,
+sjc.job_no,
+sjc.subjob_no) sc,
+(select crh.cfs_code,
+crh.cfs_receive_no,
+crh.cfs_receive_date,
+crh.cha_code,
+crh.cha_name,
+crh.segment_code,
+forwarder_code,
+crd.shipping_bill_no,
+crd.shipping_bill_date,
+crd.carting_date,
+crd.customs_clearing_date,
+crd.external_pack_code,
+crd.external_no_of_pack,
+crd.gross_weight,
+crd.volume,
+crd.cfs_slot_code,
+crd.item_description,
+crd.cfs_mark_no,
+crh.cfs_note,
+crd.un_no,
+crd.pcin_no,
+crd.imo_code,
+crh.is_audit,
+crh.audit_on,
+crh.audited_by,
+crh.routing_no
+from cfs_receive_header crh,
+cfs_receive_detail crd
+where crh.cfs_receive_no = crd.cfs_receive_no
+and crh.status <> ('CANCELLED')) cfs,
+(select segment_Code,job_no,job_subjob_uid,max(case when document_code ='SB' then 'Y'
+end) sb,max(case when document_code = 'MM' then 'Y' end) MM
+from job_document
+group by segment_Code,job_no,job_subjob_uid) jd
+where sjt.job_uid = j.job_uid
+and sjt.subjob_uid = sj.subjob_uid
+and sjt.subjob_uid = jci.job_subjob_uid(+)
+and sjt.segment_code = sc.segment_code
+and sjt.job_no = sc.job_no
+and sjt.subjob_no = sc.subjob_no
+and sj.transit_port = pm.code (+)
+and sm.code = sjt.segment_Code
+and sjt.company_Code = sc.company_code
+and sjt.branch_code = sc.branch_Code
+and sjt.segment_Code = jd.segment_Code(+)
+and sjt.job_no       = jd.job_no(+)
+and sjt.job_uid = jd.job_subjob_uid(+)
+and sm.import_export = 'IMPORT'
+and sjt.trade_code in ('IMPORT','TRANSIT')
+and (pk_port_master.get_port_country_code(j.pod) <> pk_port_master.get_port_country_code(sj.fdc))
+and sjt.reference_job_no is null
+and nvl(sjt.subjob_status,'GENERATED') <> 'CANCEL'
+and sj.subjob_uid = sfs.subjob_uid (+)
+and sj.transit_schedule_uid = sfs.schedule_uid (+)
+and jci.cfs_receive_no=cfs.cfs_receive_no(+)
+and jci.shipping_bill_no = cfs.shipping_bill_no(+)
+and ( (not exists ( select 1 from job_delivery jd
+where sjt.company_code = jd.company_code
+and sjt.branch_code = jd.branch_code
+and sjt.subjob_uid = jd.job_subjob_uid)
+and nvl(pk_configuration_master.get_value(sjt.company_code,'IMPORT_ENTER_SHOW_IN_CFS'),'N') ='Y'
+and sjt.trade_code = 'IMPORT')
+or
+(sjt.trade_code = 'TRANSIT')
+))
+where seq in(1,1111);
+/
+CREATE TABLE cargoes_carrier_master
+    (cargoes_carrier_code           VARCHAR2(100 CHAR),
+    cargoes_carrier_name           VARCHAR2(1000 CHAR),
+    carrier_code                   VARCHAR2(10 CHAR),
+    carrier_name                   VARCHAR2(100 CHAR))
+/
+CREATE TABLE web_cargoes_shptevents_hist
+    (create_user                    VARCHAR2(30 CHAR) NOT NULL,
+    create_date                    DATE NOT NULL,
+    run_user                       VARCHAR2(30 CHAR) NOT NULL,
+    run_date                       DATE NOT NULL,
+    service_id                     VARCHAR2(100 CHAR) NOT NULL,
+    sl_no                          NUMBER(38,10) NOT NULL,
+    mbl_no                         VARCHAR2(30 CHAR),
+    container_no                   VARCHAR2(30 CHAR),
+    code                           VARCHAR2(200 CHAR),
+    name                           VARCHAR2(200 CHAR),
+    estimatetime                   VARCHAR2(100 CHAR),
+    actualtime                     VARCHAR2(100 CHAR),
+    location                       VARCHAR2(100 CHAR),
+    locationcode                   VARCHAR2(100 CHAR),
+    hascargo                       VARCHAR2(10 CHAR),
+    lov_status                     VARCHAR2(30 CHAR))
+/
+CREATE OR REPLACE VIEW CONTAINER_TRAC_STATUS_DIS ("CONTAINER_NO", "CARGOES_CARRIER_CODE", "CARRIER_CODE", "HSCODE", "JOB_UID", "MASTER_NO", "TYPE1", "CREATE_DATE", "TYPE2", "TYPE3", "TYPE4", "TYPE5", "TYPE6", "TYPE7", "TYPE8", "TYPE9", "TYPE10", "TYPE11") AS
+  SELECT
+    a.container_no,
+    ccm.cargoes_carrier_code,
+    j.carrier_code,
+    '' hsCode,
+    max(j.job_uid) job_uid,
+    max(replace(master_no, '.', '')) master_no,
+    max(b.create_date) create_date,
+    MAX(CASE WHEN a.name = 'Empty Container Gate Out' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type1,
+    MAX(CASE WHEN a.name = 'Full Container Gate In' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type2,
+    MAX(CASE WHEN a.name = 'Vessel Arrival in Vicinity' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type3,
+    MAX(CASE WHEN a.name = 'Vessel Departure AIS' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type4,
+    MAX(CASE WHEN a.name = 'Move to Container Yard' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type5,
+    MAX(CASE WHEN a.name = 'Load on Vessel' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type6,
+    MAX(CASE WHEN a.name = 'Vessel Departure' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type7,
+    MAX(CASE WHEN a.name = 'Vessel Arrival AIS' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type8,
+    MAX(CASE WHEN a.name = 'Vessel Arrival' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type9,
+    MAX(CASE WHEN a.name = 'Discharge from Vessel' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type10,
+    MAX(CASE WHEN a.name = 'Full Container Gate Out' THEN to_Char(to_date(a.actualtime,'YYYY-MM-DD HH:MI:SS AM'),'DD-MM-YYYY') END) AS type11
+FROM
+    (SELECT * FROM web_cargoes_shipmentevents
+     UNION ALL
+     SELECT * FROM WEB_CARGOES_SHPTEVENTS_HIST) a,
+     job_container b,
+     job j,
+     cargoes_carrier_master ccm
+WHERE
+    a.container_no = b.container_no
+and j.job_uid = b.job_uid
+and j.carrier_code = ccm.carrier_code(+)
+and b.segment_code in (select code from segment_master where transport_mode='SEA' and software_code in ('SFS','CHA')
+                                               and object_name in ('CHA_EXP_CLEARANCE_JOB','CHA_IMP_CLEARANCE_JOB'))
+/*and b.container_no not in (select distinct container_no from web_cargoes_shipmentevents where container_no is not null
+                            union all
+                            select 'ABCD0000001' from dual
+                            union all
+                            select 'ABCD1254631' from dual
+                            union all
+                            select 'ABCD0000000' from dual
+                            union all
+                            select 'ABCD1234567' from dual
+                            union all
+                            SELECT distinct container_no FROM web_cargoes_cont_response where container_no <> 'RLTU2098332')*/
+and j.ata is null
+GROUP BY
+    a.container_no,
+    ccm.cargoes_carrier_code,
+    j.carrier_code;
+/
+CREATE OR REPLACE VIEW ENQUIRY_RATE_REQ_DASHBOARD_V
+AS
+  SELECT eq.create_user,
+    eq.create_date,
+    eq.run_user,
+    eq.run_date,
+    eq.branch_code,
+    eq.location_code,
+    pk_branch_master.get_location_name(eq.location_code) location_name,
+    eq.code enquiry_no,
+    eqd.line_no line_no,
+    evd.sl_no vendor_sl_no,
+    evd.final rate_final,
+    eq.enquiry_date,
+    pk_employee_master.get_name(eq.salesman_code) enquiry_created_by,
+    pk_adm_user_master.get_employee_email(eq.company_code,eq.create_user) to_mail_id,
+    eq.customer_code,
+    pk_customer_master.get_name(eq.customer_code) customer_name,
+    eq.sales_coordinator salesman_code,
+    pk_employee_master.get_name(eq.sales_coordinator) salesman_name,
+    eqd.segment_code,
+    eqd.terms tos_code,
+    eqd.customer_code segment_customer_code,
+    pk_customer_master.get_name(eqd.customer_code) segment_customer_name,
+    eqd.pol por,
+    eqd.por pol,
+    eqd.fdc pod,
+    eqd.pod fdc,
+    eqd.who_routed,
+    evd.vendor_code,
+    pk_customer_master.get_name(evd.vendor_code) vendor_name,
+    NVL(evd.final,'N') final,
+    eq.quotation_no
+  FROM enquiry_log eq,
+    enquiry_log_detail eqd,
+    enquiry_rate_header erh,
+    enquiry_vendor_details evd
+  WHERE eq.code               = eqd.log_code
+  AND eq.code                 = erh.enquiry_no
+  AND eqd.line_no             = erh.sl_no
+  AND erh.enquiry_no          = evd.enquiry_no
+  AND erh.sl_no               = evd.line_no
+  AND NVL(eqd.enquiry_log_detail_status,'ACTIVE') ='ACTIVE'
+  AND TRUNC(EQ.ENQUIRY_DATE) >= TRUNC(SYSDATE-30)
+  ORDER BY eq.enquiry_date DESC;
+/
+
+create or replace view payment_request_view (
+   create_user,
+   create_date,
+   run_user,
+   run_date,
+   company_code,
+   branch_code,
+   location_code,
+   payment_request_no,
+   payment_request_type,
+   payment_request_date,
+   segment_code,
+   job_no,
+   paid_to_flag,
+   paid_to,
+   note,
+   accountant_note,
+   approved,
+   subledger_code,
+   agent_bill_no,
+   agent_bill_currency_code,
+   agent_bill_amount,
+   is_not_over,
+   account_code,
+   payment_did,
+   approved_by,
+   approved_date)
+AS
+select
+    ph.create_user,
+    ph.create_date,
+    ph.run_user,
+    ph.run_date,
+    ph.company_code,
+    ph.branch_code,
+    ph.location_code,
+    ph.payment_request_no,
+    ph.payment_request_type,
+    ph.payment_request_date,
+    pd.segment_code,
+    pd.job_no,
+    ph.paid_to_flag,       -- GEN-1308
+    ph.paid_to,
+    ph.note,
+    ph.accountant_note,
+    ph.approved,
+    ph.subledger_code,
+    ph.agent_bill_no,
+    ph.agent_bill_currency_code,
+    ph.agent_bill_amount,
+    ph.is_not_over,
+    ph.account_code,
+    ph.payment_did,
+    pk_employee_master.get_name(ph.approved_by) approved_by,
+    ph.approved_date
+from fas_payment_request_header ph,
+    (select distinct payment_request_no,
+            segment_code,
+            job_no
+    from fas_payment_request_detail) pd
+where ph.payment_request_no  = pd.payment_request_no
+and   ph.payment_request_date  >= nvl(pk_configuration_master.get_value(ph.company_code,'PAYMENT_REQ_START_DATE'),to_date('01-APR-14','DD-MM-YY'))
+insert into combobox_header(create_user,create_date,run_user,run_date,list_id,list_code,list_name,
+query,note,default_order,retrival_type,retrive_interval)
+values ('LIVE',sysdate,'LIVE',sysdate,'9839','HBL LINE MASTER','HBL Line Master List',
+'select  display_value ,return_value,code assign_value  from
+(select decode(lov_status, ''BLOCK'', substr(name, 1,70)||'' [BLOCKED]'', name)||'' (''||CODE||'')'' display_value, 2 order_level, rank() over (order by name) order_level_detail,NAME return_value,code from hbl_line_master
+ where name like ''NAME_IN(BLOCK_NAME.COLUMN_NAME)%''
+ and lov_status <> ''HIDE''
+ union
+ select decode(lov_status, ''BLOCK'', substr(name, 1,70)||'' [BLOCKED]'', name)||'' (''||CODE||'')'' display_value, 1 order_level, rank() over (order by code) order_level_detail,NAME return_value,code from hbl_line_master
+ where REGEXP_LIKE(code,''^NAME_IN(BLOCK_NAME.COLUMN_NAME)'')
+ and code <> name
+ and REGEXP_INSTR(name,''^NAME_IN(BLOCK_NAME.COLUMN_NAME)'') = 0
+ and lov_status <> ''HIDE''
+ order by  order_level,order_level_detail
+)','','','','');
+/
+
+
+-- End of DDL Script for Trigger LIVE.PRE_SUBJOB
+
+create or replace public synonym cargoes_carrier_master for cargoes_carrier_master
+/
+grant all on cargoes_carrier_master to user_role
+/
+create or replace public synonym web_cargoes_shptevents_hist for web_cargoes_shptevents_hist 
+/
+grant all on web_cargoes_shptevents_hist to user_role
+/
+
+
+
+
+
+
+
+
+
+
+
+
